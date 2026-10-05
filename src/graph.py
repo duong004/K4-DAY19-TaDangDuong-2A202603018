@@ -265,14 +265,49 @@ class Neo4jGraph:
 
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
         """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        raise NotImplementedError("TODO KG-3 Neo4jGraph.context (src/graph.py) - kiểm tra: python bench_kg.py --check")
+        seed_ids, facts = self.seed_facts(question, doc_ids, limit=max_facts // 2)
+        if not seed_ids:
+            return facts
+        case_rows = self.run(
+            """
+            MATCH (k:Case)
+            WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN$ids }
+            RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary
+            """,
+            ids=seed_ids,
+        )
+        case_ids = [r["id"] for r in case_rows]
+        for r in case_rows:
+            if r.get("name") and r.get("summary"):
+                facts.append(f"Vụ việc '{r['name']}': {r['summary']}")
+        if case_ids:
+            clause_rows = self.run(
+                """
+                MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE elementId(k) IN $case_ids
+                  AND (cl.number = 1 OR EXISTS { MATCH (k)-[:INVOLVES]->(s:Substance)<-[:MENTIONS]-(cl) })
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                ORDER BY article_id, number
+                """,
+                case_ids=case_ids,
+            )
+            for cl in clause_rows:
+                facts.append(f"[{cl['article_id']} - {cl['title']}] khoản {cl['number']}: {cl['text']}")
+        return facts[:max_facts]
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
 def build_graph(graph: Neo4jGraph, law_docs: list[Document], news_docs: list[Document],
                 llm_fn: Callable[..., str]) -> None:
     """Load both KBs into an empty graph. llm_fn(prompt, json_mode=False) -> str (metered OpenAI chat)."""
-    raise NotImplementedError("TODO KG-2 build_graph (src/graph.py) - kiểm tra: python bench_kg.py --build --limit 2")
+    graph.suggested_constraints()
+    articles = [parse_law_article(d) for d in law_docs]
+    for a in articles:
+        graph.add_law_article(a)
+    crimes = [a["crime"] for a in articles if a.get("crime")]
+    for d in news_docs:
+        for case in extract_news_cases(d, lambda p: llm_fn(p, json_mode=True), crimes):
+            graph.add_news_case(case, d)
 
 # ---------------------------------------------------------------------------------------------- KG-4
 
@@ -297,4 +332,13 @@ class GraphRAGAgent:
         self.llm_fn = llm_fn
 
     def answer(self, question: str, top_k: int = 3) -> str:
-        raise NotImplementedError("TODO KG-4 GraphRAGAgent.answer (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k GraphRAGAgent")
+        chunks = self.store.search(question, top_k=top_k)
+        doc_ids = []
+        for c in chunks:
+            did = c.get("metadata", {}).get("doc_id")
+            if did and did not in doc_ids:
+                doc_ids.append(did)
+        facts = self.graph.context(question, doc_ids)
+        facts_text = "\n".join(f"- {f}" for f in facts) if facts else "(không có)"
+        chunks_text = "\n\n".join(f"[{i}] {chunk['content']}" for i, chunk in enumerate(chunks, start=1))
+        return self.llm_fn(GRAPH_PROMPT.format(facts=facts_text, chunks=chunks_text, question=question))
