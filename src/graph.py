@@ -32,10 +32,35 @@ from .models import Document
 from .store import EmbeddingStore
 
 # Canonical substance names: the ones BLHS Chương XX lists, plus common ones in Vietnamese news.
+# Canonical substance names: the ones BLHS Chương XX lists, plus common ones in Vietnamese news.
 SUBSTANCES = ["Heroine", "Cocaine", "Methamphetamine", "Amphetamine", "MDMA", "XLR-11", "Ketamine",
               "cần sa", "thuốc phiện", "côca"]
 CLAUSE_START = re.compile(r"^(\d+)\.\s", re.MULTILINE)
 FOOTNOTE = re.compile(r"\[\d+\]")
+
+# Bảng ánh xạ tên đồng nghĩa / tiếng lóng sang tên chuẩn
+SUBSTANCE_SYNONYMS = {
+    "thuốc lắc": "MDMA",
+    "kẹo": "MDMA",
+    "ma túy đá": "Methamphetamine",
+    "đá": "Methamphetamine",
+    "hồng phiến": "Amphetamine",
+    "cỏ mỹ": "cần sa",
+    "tài mà": "cần sa",
+    "bồ đà": "cần sa",
+    "bạch phiến": "Heroine",
+}
+
+def find_substances(text: str) -> list[str]:
+    lowered = text.lower()
+    found = set()
+    for name in SUBSTANCES:
+        if name.lower() in lowered:
+            found.add(name)
+    for syn, canon in SUBSTANCE_SYNONYMS.items():
+        if syn in lowered:
+            found.add(canon)
+    return sorted(found)
 
 def load_markdown_docs(folder: str | Path) -> list[Document]:
     """Read crawler output (.md with a flat `key: "value"` front matter) into Documents."""
@@ -61,24 +86,25 @@ def link_entity(name: str, known: list[str], normalize: Callable[[str], str] = n
     if not norm_name:
         return None
 
+    # Ánh xạ từ chuỗi đã chuẩn hóa -> chuỗi gốc trong known
     norm_to_orig: dict[str, str] = {}
     for k in known:
         nk = normalize(k)
         if nk and nk not in norm_to_orig:
             norm_to_orig[nk] = k
 
+    # 1. Khớp chính xác sau khi chuẩn hóa
     if norm_name in norm_to_orig:
         return norm_to_orig[norm_name]
 
+    # 2. Khớp mờ (fuzzy match) với ngưỡng tương đồng cutoff=0.8
     matches = difflib.get_close_matches(norm_name, list(norm_to_orig.keys()), n=1, cutoff=0.8)
     if matches:
         return norm_to_orig[matches[0]]
 
     return None
 
-def find_substances(text: str) -> list[str]:
-    lowered = text.lower()
-    return [name for name in SUBSTANCES if name.lower() in lowered]
+
 
 # ----------------------------------------------------------------------------------------------
 # HINT — suggested ontology: extraction helpers
@@ -86,11 +112,15 @@ def find_substances(text: str) -> list[str]:
 
 def parse_law_article(doc: Document) -> dict[str, Any]:
     """Deterministic (regex) extraction for one 'Điều' — law text is regular enough to skip the LLM."""
-    article_id = doc.metadata["article"]                       # "Điều 251 BLHS"
-    title = doc.metadata["title"].split(". ", 1)[-1]           # "Tội mua bán trái phép chất ma túy"
+    article_id = doc.metadata.get("article", doc.id)           # "Điều 251 BLHS"
+    title_raw = doc.metadata.get("title", "")
+    title = title_raw.split(". ", 1)[-1] if ". " in title_raw else title_raw
     body = FOOTNOTE.sub("", doc.content)
     starts = list(CLAUSE_START.finditer(body))
     clauses = []
+    terms = []
+
+    # Trích xuất các khoản
     for index, start in enumerate(starts):
         end = starts[index + 1].start() if index + 1 < len(starts) else len(body)
         text = body[start.start():end].strip()
@@ -103,6 +133,17 @@ def parse_law_article(doc: Document) -> dict[str, Any]:
             "text": text,
             "substances": find_substances(text),
         })
+
+    # Nếu là điều luật giải thích định nghĩa (như Luật Phòng chống ma túy Điều 2)
+    term_matches = re.findall(r"(?:^|\n)\d+\.\s*([^\n:]+?)\s+là\s+([^\n]+)", body)
+    for term_name, term_def in term_matches:
+        t_clean = term_name.strip(" *\"'“”").lower()
+        if len(t_clean) <= 40:
+            terms.append({
+                "name": t_clean,
+                "definition": f"{term_name.strip()} là {term_def.strip()}",
+            })
+
     return {
         "id": article_id,
         "law": doc.metadata.get("law", ""),
@@ -110,11 +151,14 @@ def parse_law_article(doc: Document) -> dict[str, Any]:
         "doc_id": doc.id,
         "crime": normalize_crime(title) if title.startswith("Tội ") else None,
         "clauses": clauses,
+        "terms": terms,
+        "max_clause_number": max((c["number"] for c in clauses), default=1),
     }
 
 NEWS_EXTRACTION_PROMPT = """Bạn trích xuất knowledge graph từ một bài báo tiếng Việt về ma túy.
 Chỉ dùng thông tin có trong bài. Trả về JSON đúng dạng:
-{{"cases": [{{"name": "tên ngắn của vụ việc, ví dụ: Vụ mua bán 36kg ma túy tại TP.HCM",
+{{"cases": [{{
+  "name": "tên ngắn của vụ việc, ví dụ: Vụ mua bán 36kg ma túy tại TP.HCM",
   "summary": "1-2 câu tóm tắt",
   "date": "ngày xảy ra/xét xử nếu có, dạng YYYY-MM-DD hoặc chuỗi rỗng",
   "location": "tỉnh/thành phố, chuỗi rỗng nếu không rõ",
@@ -221,13 +265,13 @@ class Neo4jGraph:
 
     def suggested_constraints(self) -> None:
         for label, key in [("Article", "id"), ("Clause", "id"), ("Crime", "name"), ("Case", "name"),
-                           ("Substance", "name"), ("Person", "name"), ("Location", "name")]:
+                           ("Substance", "name"), ("Person", "name"), ("Location", "name"), ("LegalTerm", "name")]:
             self.run(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.{key} IS UNIQUE")
 
     def add_law_article(self, article: dict) -> None:
         self.run(
             """
-            MERGE (a:Article {id: $id}) SET a.title =$title, a.law = $law, a.doc_id =$doc_id
+            MERGE (a:Article {id: $id}) SET a.title = $title, a.law = $law, a.doc_id = $doc_id, a.max_clause = $max_clause_number
             FOREACH (crime IN CASE WHEN $crime IS NULL THEN [] ELSE [$crime] END |
                 MERGE (c:Crime {name: crime}) MERGE (a)-[:DEFINES]->(c))
             WITH a
@@ -235,16 +279,31 @@ class Neo4jGraph:
             MERGE (cl:Clause {id: clause.id})
               SET cl.number = clause.number, cl.penalty = clause.penalty, cl.text = clause.text, cl.doc_id = $doc_id
             MERGE (a)-[:HAS_CLAUSE]->(cl)
+            FOREACH (_ IN CASE WHEN clause.number = $max_clause_number THEN [1] ELSE [] END |
+                MERGE (a)-[:HAS_MAX_CLAUSE]->(cl))
             FOREACH (s IN clause.substances | MERGE (sub:Substance {name: s}) MERGE (cl)-[:MENTIONS]->(sub))
+            WITH a
+            UNWIND $terms AS tm
+            MERGE (t:LegalTerm {name: tm.name})
+              SET t.definition = tm.definition, t.doc_id = $doc_id
+            MERGE (a)-[:DEFINES_TERM]->(t)
             """,
             **article,
         )
 
     def add_news_case(self, case: dict, doc: Document) -> None:
+        # Chuẩn hóa tên chất sang danh mục chuẩn nếu là từ đồng nghĩa
+        raw_subs = case.get("substances", [])
+        norm_subs = []
+        for s in raw_subs:
+            s_name = s.get("name", "")
+            canon = SUBSTANCE_SYNONYMS.get(s_name.lower(), s_name)
+            norm_subs.append({"name": canon, "amount": s.get("amount", "")})
+
         self.run(
             """
             MERGE (k:Case {name: $name})
-              SET k.summary = $summary, k.date =$date, k.doc_id = $doc_id, k.source_title =$title
+              SET k.summary = $summary, k.date = $date, k.doc_id = $doc_id, k.source_title = $title
             FOREACH (loc IN CASE WHEN $location = '' THEN [] ELSE [$location] END |
                 MERGE (l:Location {name: loc}) MERGE (k)-[:LOCATED_IN]->(l))
             FOREACH (crime IN $charges | MERGE (c:Crime {name: crime}) MERGE (k)-[:CHARGED_WITH]->(c))
@@ -252,26 +311,63 @@ class Neo4jGraph:
                 SET r.amount = s.amount)
             FOREACH (p IN $people | MERGE (person:Person {name: p.name})
                 SET person.aliases = coalesce(p.aliases, [])
-                MERGE (person)-[r:INVOLVED_IN]->(k) SET r.role = p.role, r.charge = p.charge, r.sentence = p.sentence)
+                MERGE (person)-[r:INVOLVED_IN]->(k) SET r.role = p.role, r.charge = p.charge, r.sentence = p.sentence
+                FOREACH (chg IN CASE WHEN p.charge = '' THEN [] ELSE [p.charge] END |
+                    MERGE (crime_p:Crime {name: chg})
+                    MERGE (person)-[rc:CHARGED_WITH]->(crime_p)
+                    SET rc.sentence = p.sentence, rc.role = p.role))
             """,
             name=case.get("name") or doc.metadata.get("title", doc.id),
             summary=case.get("summary", ""), date=case.get("date", ""), location=case.get("location", ""),
             charges=case.get("charges", []), people=[p for p in case.get("people", []) if p.get("name")],
-            substances=[s for s in case.get("substances", []) if s.get("name")],
+            substances=norm_subs,
             doc_id=doc.id, title=doc.metadata.get("title", ""),
         )
 
     # ---------------------------------------------------------------- KG-3
 
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
-        """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        seed_ids, facts = self.seed_facts(question, doc_ids, limit=max_facts // 2)
-        if not seed_ids:
-            return facts
+        """Graph facts for a question: multi-hop traversal with direct liability & max penalty support."""
+        facts: list[str] = []
+        is_max_query = any(k in question.lower() for k in ["tối đa", "cao nhất", "khung cao nhất"])
+
+        # 1. Kiểm tra định nghĩa pháp lý (Giải quyết Q1)
+        term_rows = self.run(
+            """
+            MATCH (t:LegalTerm)
+            WHERE toLower($q) CONTAINS toLower(t.name)
+            RETURN t.name AS name, t.definition AS definition
+            """,
+            q=question,
+        )
+        for t in term_rows:
+            facts.append(f"[Định nghĩa pháp lý] {t['definition']}")
+
+        # 2. Truy vấn trực tiếp cá nhân để tránh nhiễu đồng phạm (Giải quyết Q3)
+        person_rows = self.run(
+            """
+            MATCH (p:Person)
+            WHERE toLower($q) CONTAINS toLower(p.name)
+            OPTIONAL MATCH (p)-[r:INVOLVED_IN]->(k:Case)
+            OPTIONAL MATCH (p)-[rc:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)
+            RETURN p.name AS person, r.sentence AS sentence, r.role AS role, k.name AS case_name,
+                   c.name AS crime, a.id AS article_id
+            """,
+            q=question,
+        )
+        for pr in person_rows:
+            if pr.get("crime") and pr.get("sentence"):
+                facts.append(f"Bị cáo '{pr['person']}' trong '{pr['case_name']}': bị xét xử về '{pr['crime']}' ({pr.get('article_id', '')}), mức án tuyên: {pr['sentence']}")
+
+        # 3. Lấy seed facts thông thường
+        seed_ids, raw_facts = self.seed_facts(question, doc_ids, limit=max_facts // 2)
+        facts.extend(raw_facts)
+
+        # 4. Lấy tóm tắt các Case
         case_rows = self.run(
             """
             MATCH (k:Case)
-            WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN$ids }
+            WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
             RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary
             """,
             ids=seed_ids,
@@ -280,33 +376,86 @@ class Neo4jGraph:
         for r in case_rows:
             if r.get("name") and r.get("summary"):
                 facts.append(f"Vụ việc '{r['name']}': {r['summary']}")
+
+        # 5. Multi-hop sang điều khoản luật tương ứng (Hỗ trợ Q4 & Q5)
         if case_ids:
             clause_rows = self.run(
                 """
                 MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
                 WHERE elementId(k) IN $case_ids
-                  AND (cl.number = 1 OR EXISTS { MATCH (k)-[:INVOLVES]->(s:Substance)<-[:MENTIONS]-(cl) })
-                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                  AND (
+                    cl.number = 1
+                    OR ($is_max AND cl.number = a.max_clause)
+                    OR EXISTS {
+                      MATCH (k)-[:INVOLVES]->(s:Substance)<-[:MENTIONS]-(cl)
+                    }
+                  )
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text, cl.penalty AS penalty
                 ORDER BY article_id, number
                 """,
-                case_ids=case_ids,
+                case_ids=case_ids, is_max=is_max_query,
             )
             for cl in clause_rows:
                 facts.append(f"[{cl['article_id']} - {cl['title']}] khoản {cl['number']}: {cl['text']}")
-        return facts[:max_facts]
+
+        # 6. Nếu câu hỏi nhắc thẳng tên Điều
+        article_matches = re.findall(r"[Đđ]iều\s+(\d+)", question)
+        if article_matches:
+            q_substances = find_substances(question)
+            article_ids = [f"Điều {m} BLHS" for m in article_matches]
+            direct_clauses = self.run(
+                """
+                MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE a.id IN $article_ids
+                  AND (
+                    cl.number = 1
+                    OR ($is_max AND cl.number = a.max_clause)
+                    OR size($substances) = 0
+                    OR EXISTS {
+                      MATCH (cl)-[:MENTIONS]->(s:Substance)
+                      WHERE s.name IN $substances
+                    }
+                  )
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                ORDER BY a.id, cl.number
+                """,
+                article_ids=article_ids, substances=q_substances, is_max=is_max_query,
+            )
+            for cl in direct_clauses:
+                fact_str = f"[{cl['article_id']} - {cl['title']}] khoản {cl['number']}: {cl['text']}"
+                if fact_str not in facts:
+                    facts.append(fact_str)
+
+        # Loại bỏ dữ kiện trùng lặp nhưng giữ nguyên thứ tự ưu tiên
+        seen = set()
+        unique_facts = []
+        for f in facts:
+            if f not in seen:
+                seen.add(f)
+                unique_facts.append(f)
+
+        return unique_facts[:max_facts]
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
 def build_graph(graph: Neo4jGraph, law_docs: list[Document], news_docs: list[Document],
                 llm_fn: Callable[..., str]) -> None:
     """Load both KBs into an empty graph. llm_fn(prompt, json_mode=False) -> str (metered OpenAI chat)."""
+    # 1. Tạo ràng buộc UNIQUE cho các khóa định danh
     graph.suggested_constraints()
+
+    # 2. Bóc tách và nạp toàn bộ văn bản Luật bằng Regex
     articles = [parse_law_article(d) for d in law_docs]
     for a in articles:
         graph.add_law_article(a)
+
+    # 3. Lấy danh sách tội danh chuẩn từ luật làm từ điển đối chiếu
     crimes = [a["crime"] for a in articles if a.get("crime")]
+
+    # 4. Trích xuất các vụ án từ tin tức bằng LLM và nạp vào Neo4j
     for d in news_docs:
-        for case in extract_news_cases(d, lambda p: llm_fn(p, json_mode=True), crimes):
+        cases = extract_news_cases(d, lambda p: llm_fn(p, json_mode=True), crimes)
+        for case in cases:
             graph.add_news_case(case, d)
 
 # ---------------------------------------------------------------------------------------------- KG-4
@@ -332,13 +481,28 @@ class GraphRAGAgent:
         self.llm_fn = llm_fn
 
     def answer(self, question: str, top_k: int = 3) -> str:
+        # 1. Vector top-k giống Flat RAG
         chunks = self.store.search(question, top_k=top_k)
-        doc_ids = []
+
+        # 2. Lấy danh sách doc_id (không trùng) từ metadata
+        doc_ids: list[str] = []
         for c in chunks:
             did = c.get("metadata", {}).get("doc_id")
             if did and did not in doc_ids:
                 doc_ids.append(did)
+
+        # 3. Mở rộng dữ kiện từ Knowledge Graph
         facts = self.graph.context(question, doc_ids)
+
+        # 4. Định dạng prompt theo chuẩn GRAPH_PROMPT
         facts_text = "\n".join(f"- {f}" for f in facts) if facts else "(không có)"
         chunks_text = "\n\n".join(f"[{i}] {chunk['content']}" for i, chunk in enumerate(chunks, start=1))
-        return self.llm_fn(GRAPH_PROMPT.format(facts=facts_text, chunks=chunks_text, question=question))
+
+        prompt = GRAPH_PROMPT.format(
+            facts=facts_text,
+            chunks=chunks_text,
+            question=question,
+        )
+
+        # 5. Gọi LLM sinh câu trả lời
+        return self.llm_fn(prompt)
